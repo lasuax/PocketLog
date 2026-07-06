@@ -292,20 +292,26 @@ local function ApplyResetSelections()
     if selected.StolenGold then
         if selected.StolenGold.Session then
             sessionGold = 0
+            sessionCount = 0
+            sessionStartTime = nil
             didReset = true
         end
         if selected.StolenGold.AllTime then
             PocketLog_Data.Gold = 0
+            if PocketLog_Data then PocketLog_Data.Count = 0 end
             didReset = true
         end
     end
     if selected.StolenItems then
         if selected.StolenItems.Session then
             sessionItems = {}
+            sessionCount = 0
+            sessionStartTime = nil
             didReset = true
         end
         if selected.StolenItems.AllTime then
             PocketLog_Data.Items = {}
+            if PocketLog_Data then PocketLog_Data.Count = 0 end
             didReset = true
         end
     end
@@ -498,14 +504,17 @@ copyrightText:SetText("Brought to you by your fellow rogue Critolis ^^,")
 local silentCheckWindow = CreateFrame("CheckButton", "PocketLogSilentCheckboxWindow", bottomBar, "UICheckButtonTemplate")
 silentCheckWindow:SetPoint("BOTTOMLEFT", bottomBar, "BOTTOMLEFT", 12, 74)
 getglobal(silentCheckWindow:GetName() .. "Text"):SetText("Disable Live Chat Spams")
+-- Initialize checkbox state from saved settings (default: enabled)
+if PocketLog_Data == nil or PocketLog_Data.SilentMode then
+    silentCheckWindow:SetChecked(1)
+else
+    silentCheckWindow:SetChecked(nil)
+end
 silentCheckWindow:SetScript("OnClick", function()
-    if PocketLog_Data then
-        if this:GetChecked() == 1 then
-            PocketLog_Data.SilentMode = true
-        else
-            PocketLog_Data.SilentMode = false
-        end
+    if not PocketLog_Data then
+        PocketLog_Data = {}
     end
+    PocketLog_Data.SilentMode = (this:GetChecked() == 1)
 end)
 
 local function PopulatePocketWindow()
@@ -630,7 +639,7 @@ frame:SetScript(
                 PocketLog_Data.Items = {}
             end
             if PocketLog_Data.SilentMode == nil then
-                PocketLog_Data.SilentMode = false
+                PocketLog_Data.SilentMode = true
             end
             if PocketLog_Data.ShowHUD == nil then
                 PocketLog_Data.ShowHUD = true
@@ -662,6 +671,14 @@ frame:SetScript(
             end
 
             ApplyResetSelectionsToUI()
+            -- Sync silent checkbox state after saved-vars load (ensure UI reflects saved value)
+            if silentCheckWindow then
+                if PocketLog_Data.SilentMode then
+                    silentCheckWindow:SetChecked(1)
+                else
+                    silentCheckWindow:SetChecked(nil)
+                end
+            end
             UpdateHUDText()
             return
         end
