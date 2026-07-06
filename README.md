@@ -19,5 +19,5 @@ Live HUD & Quiet Mode
 Notes
 - This addon targets Classic WoW (1.12) compatibility and uses built-in UI templates.
 
-Credits
-Brought to you by your fellow rogue Critolis
+### Credits
+Brought to you by your fellow rogue Critolis with the help of free GPT-5 mini. Special thanks to the syndicate mobs at the Durnholde Keep helping me on my debugging session by offering me their pockets ^^,
