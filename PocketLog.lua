@@ -6,10 +6,16 @@ frame:RegisterEvent("CHAT_MSG_SPELL_SELF_BUFF")
 
 local sessionGold, sessionCount, sessionItems = 0, 0, {}
 local sessionBoxGold, sessionBoxItems = 0, {}
-local activeLootCache, isPickpocketActive, slotClearedThisWindow = {}, false, false
-local sessionStartTime = nil
-local isOpeningJunkbox = false
-local currentBoxName = ""
+local activeLootCache = {}
+local slotClearedThisWindow = false
+local sessionPaused = false
+local pauseStarted = nil
+
+-- Current loot source.
+-- nil   = ordinary loot
+-- "pick" = pickpocket
+-- "box"  = junkbox
+local lootMode = nil
 
 local function FormatMoney(amt)
     local g, s, c = math.floor(amt / 10000), math.floor(math.mod(amt, 10000) / 100), math.mod(amt, 100)
@@ -23,38 +29,68 @@ local function FormatMoney(amt)
     return str .. c .. "c"
 end
 
-local function PrintCollection(title, dataset)
-    DEFAULT_CHAT_FRAME:AddMessage("|cff00ff00" .. title .. ":|r")
-    local empty = true
-    for name, qty in pairs(dataset) do
-        if qty > 0 then
-            DEFAULT_CHAT_FRAME:AddMessage("  - " .. name .. " x" .. qty)
-            empty = false
-        end
+local function FormatElapsedTime(seconds)
+
+    seconds = math.floor(seconds)
+
+    local hours = math.floor(seconds / 3600)
+    local minutes = math.floor(math.mod(seconds, 3600) / 60)
+    local secs = math.mod(seconds, 60)
+
+    if hours > 0 then
+        return string.format("%02d:%02d:%02d", hours, minutes, secs)
+    else
+        return string.format("%02d:%02d", minutes, secs)
     end
-    if empty then
-        DEFAULT_CHAT_FRAME:AddMessage("  - No items logged yet.")
+
+end
+
+local function CreateHUDRow(parent, anchor, labelText, spacing)
+
+    spacing = spacing or -2
+
+    -- Give extra space after the title.
+    if anchor == hudTitle then
+        spacing = -8
     end
+
+    local label = parent:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+    label:SetPoint("TOPLEFT", anchor, "BOTTOMLEFT", 0, spacing)
+    label:SetWidth(90)
+    label:SetJustifyH("LEFT")
+    label:SetText("|cffFFD100"..labelText.."|r")
+
+    local colon = parent:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+    colon:SetPoint("LEFT", label, "RIGHT", 0, 0)
+    colon:SetText(":")
+
+    local value = parent:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+    value:SetPoint("LEFT", colon, "RIGHT", 5, 0)
+
+    return label, value
 end
 
 local hudFrame = CreateFrame("Frame", "PocketLogHUDFrame", UIParent)
-hudFrame:SetWidth(180)
-hudFrame:SetHeight(75)
+hudFrame:SetWidth(170)
+hudFrame:SetHeight(70)
 hudFrame:SetPoint("CENTER", UIParent, "CENTER", 100, 100)
 hudFrame:SetFrameStrata("HIGH")
 hudFrame:SetFrameLevel(1)
 hudFrame:SetClampedToScreen(true)
 hudFrame:SetToplevel(true)
-hudFrame:SetBackdrop(
-    {
-        bgFile = "Interface\\Tooltips\\UI-Tooltip-Background",
-        edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
-        tile = true,
-        tileSize = 16,
-        edgeSize = 16,
-        insets = {left = 4, right = 4, top = 4, bottom = 4}
+hudFrame:SetBackdrop({
+    bgFile = "Interface\\Tooltips\\UI-Tooltip-Background",
+    edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+    tile = true,
+    tileSize = 16,
+    edgeSize = 16,
+    insets = {
+        left = 4,
+        right = 4,
+        top = 4,
+        bottom = 4
     }
-)
+})
 hudFrame:SetBackdropColor(0, 0, 0, 0.4)
 hudFrame:SetBackdropBorderColor(0.3, 0.3, 0.3, 0.6)
 hudFrame:SetMovable(true)
@@ -75,44 +111,82 @@ end)
 
 local hudTitle = hudFrame:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
 hudTitle:SetPoint("TOPLEFT", hudFrame, "TOPLEFT", 10, -8)
-hudTitle:SetText("|cff00ff00PocketLog Session|r")
-local hudTargets = hudFrame:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
-hudTargets:SetPoint("TOPLEFT", hudTitle, "BOTTOMLEFT", 0, -4)
-local hudMoney = hudFrame:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
-hudMoney:SetPoint("TOPLEFT", hudTargets, "BOTTOMLEFT", 0, -4)
-local hudValue = hudFrame:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
-hudValue:SetPoint("TOPLEFT", hudMoney, "BOTTOMLEFT", 0, -4)
+hudTitle:SetText("|cff00ff00PocketLog|r")
+local hudLabelTargets, hudValueTargets = CreateHUDRow(hudFrame, hudTitle, "Pickpockets", -8)
+local hudLabelGold, hudValueGold = CreateHUDRow(hudFrame, hudLabelTargets, "Gold")
+local hudLabelAverage, hudValueAverage = CreateHUDRow(hudFrame, hudLabelGold, "Avg Value")
 
 local function UpdateHUDText()
-    local gHrSpeed = 0
-    if sessionStartTime and sessionGold > 0 then
-        local elapsed = GetTime() - sessionStartTime
-        if elapsed > 1 then
-            gHrSpeed = math.floor((sessionGold / elapsed) * 3600)
-        end
+
+    local average = 0
+
+    if sessionCount > 0 then
+        average = math.floor(sessionGold / sessionCount)
     end
 
-    hudTargets:SetText("Mobs Mugged: " .. sessionCount)
-    hudMoney:SetText("Liberated Coins: " .. FormatMoney(sessionGold))
-    hudValue:SetText("Gold/Hr: |cffffffff" .. FormatMoney(gHrSpeed) .. "|r")
+    hudValueTargets:SetText(sessionCount)
+    hudValueGold:SetText(FormatMoney(sessionGold))
+    hudValueAverage:SetText(FormatMoney(average))
+
+    if sessionPaused then
+
+        hudTitle:SetText("|cffff4040PocketLog (Paused)|r")
+
+    elseif sessionStartTime then
+
+        hudTitle:SetText(string.format("|cff00ff00PocketLog|r [%s]", FormatElapsedTime(GetTime() - sessionStartTime)))
+
+    else
+
+        hudTitle:SetText("|cff00ff00PocketLog|r")
+
+    end
+
 end
 
+local hudRefreshTimer = nil
+local hudUpdateTimer = 0
+
+hudFrame:SetScript("OnUpdate", function()
+
+    -- Delayed refresh after loot
+    if hudRefreshTimer and GetTime() >= hudRefreshTimer then
+        UpdateHUDText()
+        hudRefreshTimer = nil
+    end
+
+    -- Live timer update once per second
+    if sessionStartTime and not sessionPaused then
+
+        hudUpdateTimer = hudUpdateTimer + arg1
+
+        if hudUpdateTimer >= 1 then
+            hudUpdateTimer = 0
+            UpdateHUDText()
+        end
+
+    end
+
+end)
 
 -- Create a dedicated PocketLog window to display summaries (avoids chat spam)
 local pocketWindow = CreateFrame("Frame", "PocketLogWindow", UIParent)
 pocketWindow:SetWidth(380)
 pocketWindow:SetHeight(380)
 pocketWindow:SetPoint("CENTER", UIParent, "CENTER", 0, 0)
-pocketWindow:SetBackdrop(
-    {
-        bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
-        edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
-        tile = true,
-        tileSize = 32,
-        edgeSize = 32,
-        insets = {left = 8, right = 8, top = 8, bottom = 8}
+pocketWindow:SetBackdrop({
+    bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
+    edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
+    tile = true,
+    tileSize = 32,
+    edgeSize = 32,
+    insets = {
+        left = 8,
+        right = 8,
+        top = 8,
+        bottom = 8
     }
-)
+})
 pocketWindow:SetMovable(true)
 pocketWindow:EnableMouse(true)
 pocketWindow:RegisterForDrag("LeftButton")
@@ -126,12 +200,45 @@ pocketWindow:Hide()
 
 local pTitle = pocketWindow:CreateFontString(nil, "ARTWORK", "GameFontNormal")
 pTitle:SetPoint("TOP", pocketWindow, "TOP", 0, -8)
-pTitle:SetText("PocketLog - Detailed View")
+pTitle:SetText("PocketLog Statistics")
 
 -- Scroll area: use a ScrollFrame with a FontString child to display lines
 local scrollFrame = CreateFrame("ScrollFrame", "PocketLogScrollFrame", pocketWindow, "UIPanelScrollFrameTemplate")
 scrollFrame:SetPoint("TOPLEFT", pocketWindow, "TOPLEFT", 12, -32)
 scrollFrame:SetPoint("BOTTOMRIGHT", pocketWindow, "BOTTOMRIGHT", -30, 140)
+local scrollbar = getglobal(scrollFrame:GetName() .. "ScrollBar")
+
+if scrollbar then
+    scrollbar:SetScript("OnValueChanged", function()
+        scrollFrame:SetVerticalScroll(arg1)
+    end)
+end
+
+scrollFrame:EnableMouseWheel(true)
+
+scrollFrame:SetScript("OnMouseWheel", function()
+
+    local current = scrollFrame:GetVerticalScroll()
+    local minv, maxv = scrollbar:GetMinMaxValues()
+
+    local step = 20
+
+    if arg1 > 0 then
+        current = current - step
+    else
+        current = current + step
+    end
+
+    if current < minv then
+        current = minv
+    elseif current > maxv then
+        current = maxv
+    end
+
+    scrollFrame:SetVerticalScroll(current)
+    scrollbar:SetValue(current)
+
+end)
 local scrollChild = CreateFrame("Frame", "PocketLogScrollChild", scrollFrame)
 scrollFrame:SetScrollChild(scrollChild)
 local childWidth = 380 - 12 - 30 - 16 -- approximate inner width with padding
@@ -142,103 +249,60 @@ pScrollText:SetPoint("TOPLEFT", scrollChild, "TOPLEFT", 0, 0)
 pScrollText:SetWidth(childWidth)
 pScrollText:SetJustifyH("LEFT")
 
-local pScrollBuffer = {}
-local pScroll = {}
--- Try to find a scrollbar child without using _G (some environments may not expose _G)
-local scrollbar = nil
-local targetName = scrollFrame:GetName() .. "ScrollBar"
-if scrollFrame and scrollFrame.GetChildren then
-    local children = {scrollFrame:GetChildren()}
-    for i = 1, (children and table.getn(children) or 0) do
-        local child = children[i]
-        if child and child.GetName and child:GetName() == targetName then
-            scrollbar = child
-            break
-        end
-    end
-end
--- If not found, attempt to get global or create a scrollbar for 1.12 compatibility
-if not scrollbar then
-    if type(getglobal) == 'function' then
-        scrollbar = getglobal(targetName)
-    end
-end
-if not scrollbar then
-    scrollbar = CreateFrame("Slider", targetName, scrollFrame, "UIPanelScrollBarTemplate")
-    scrollbar:SetPoint("TOPLEFT", scrollFrame, "TOPRIGHT", 4, -16)
-    scrollbar:SetPoint("BOTTOMLEFT", scrollFrame, "BOTTOMRIGHT", 4, 16)
-end
-if scrollbar then
-    scrollbar:SetMinMaxValues(0, 0)
-    scrollbar:SetValue(0)
-    if scrollbar.SetOrientation then
-        scrollbar:SetOrientation("VERTICAL")
-    end
-    scrollbar:SetScript("OnValueChanged", function(self, value)
-        local v = tonumber(value)
-        if scrollFrame and scrollFrame.SetVerticalScroll and v then
-            scrollFrame:SetVerticalScroll(v)
-        end
-    end)
-end
-scrollFrame:EnableMouseWheel(true)
-scrollFrame:SetScript("OnMouseWheel", function()
-    if not scrollFrame then
-        return
-    end
-    local delta = arg1
-    if not delta or type(delta) ~= "number" then
-        return
-    end
-    local current = scrollFrame:GetVerticalScroll() or 0
-    local val = current - (delta * 20)
-    local minv, maxv = 0, 0
-    if scrollbar then
-        minv, maxv = scrollbar:GetMinMaxValues()
-    end
-    if val < minv then val = minv end
-    if val > maxv then val = maxv end
-    scrollFrame:SetVerticalScroll(val)
-    if scrollbar then
-        scrollbar:SetValue(val)
-    end
-end)
+local pScroll = {
+    lines = {}
+}
+
 function pScroll:Clear()
-    pScrollBuffer = {}
-    pScrollText:SetText("")
-    scrollChild:SetHeight(scrollFrame:GetHeight())
-    if scrollFrame and scrollFrame.SetVerticalScroll then
-        scrollFrame:SetVerticalScroll(0)
-    end
-    if scrollbar then
-        scrollbar:SetMinMaxValues(0, 0)
-        scrollbar:SetValue(0)
-    end
+
+    self.lines = {}
+
 end
-function pScroll:AddMessage(msg)
-    tinsert(pScrollBuffer, msg)
-    pScrollText:SetText(table.concat(pScrollBuffer, "\n"))
-    local h = pScrollText:GetHeight() or 0
+
+function pScroll:AddMessage(text)
+
+    table.insert(self.lines, text)
+
+end
+
+function pScroll:Refresh()
+
+    local output = table.concat(self.lines, "\n")
+
+    pScrollText:SetText(output)
+
+    local h = pScrollText:GetHeight()
+
     if h < scrollFrame:GetHeight() then
         h = scrollFrame:GetHeight()
     end
+
     scrollChild:SetHeight(h)
-    if scrollFrame and scrollFrame.SetVerticalScroll then
-        local maxv = math.max(0, h - scrollFrame:GetHeight())
-        scrollFrame:SetVerticalScroll(maxv)
-        if scrollbar then
-            scrollbar:SetMinMaxValues(0, maxv)
-            scrollbar:SetValue(maxv)
-        end
+
+    local maxScroll = math.max(0, h - scrollFrame:GetHeight())
+
+    if scrollbar then
+        scrollbar:SetMinMaxValues(0, maxScroll)
+        scrollbar:SetValue(0)
     end
+
+    scrollFrame:SetVerticalScroll(0)
+
 end
 
-local resetOptionRows = {
-    {key = "StolenGold", label = "Stolen Gold"},
-    {key = "StolenItems", label = "Stolen Items"},
-    {key = "JunkboxGold", label = "Junkbox Gold"},
-    {key = "JunkboxItems", label = "Junkbox Items"}
-}
+local resetOptionRows = {{
+    key = "StolenGold",
+    label = "Stolen Gold"
+}, {
+    key = "StolenItems",
+    label = "Stolen Items"
+}, {
+    key = "JunkboxGold",
+    label = "Junkbox Gold"
+}, {
+    key = "JunkboxItems",
+    label = "Junkbox Items"
+}}
 local resetCheckboxes = {}
 
 local function ApplyResetSelectionsToUI()
@@ -246,7 +310,10 @@ local function ApplyResetSelectionsToUI()
         return
     end
     for _, row in ipairs(resetOptionRows) do
-        local settings = PocketLog_Data.ResetSelections[row.key] or {Session = false, AllTime = false}
+        local settings = PocketLog_Data.ResetSelections[row.key] or {
+            Session = false,
+            AllTime = false
+        }
         if resetCheckboxes[row.key] then
             resetCheckboxes[row.key].Session:SetChecked(settings.Session and 1 or nil)
             resetCheckboxes[row.key].AllTime:SetChecked(settings.AllTime and 1 or nil)
@@ -262,7 +329,10 @@ local function SaveResetSelection(key, column, value)
         PocketLog_Data.ResetSelections = {}
     end
     if not PocketLog_Data.ResetSelections[key] then
-        PocketLog_Data.ResetSelections[key] = {Session = false, AllTime = false}
+        PocketLog_Data.ResetSelections[key] = {
+            Session = false,
+            AllTime = false
+        }
     end
     PocketLog_Data.ResetSelections[key][column] = value
 end
@@ -298,7 +368,9 @@ local function ApplyResetSelections()
         end
         if selected.StolenGold.AllTime then
             PocketLog_Data.Gold = 0
-            if PocketLog_Data then PocketLog_Data.Count = 0 end
+            if PocketLog_Data then
+                PocketLog_Data.Count = 0
+            end
             didReset = true
         end
     end
@@ -311,7 +383,9 @@ local function ApplyResetSelections()
         end
         if selected.StolenItems.AllTime then
             PocketLog_Data.Items = {}
-            if PocketLog_Data then PocketLog_Data.Count = 0 end
+            if PocketLog_Data then
+                PocketLog_Data.Count = 0
+            end
             didReset = true
         end
     end
@@ -351,7 +425,7 @@ end
 local btnRestoreHUD = CreateFrame("Button", "PL_RestoreHUDBtn", pocketWindow, "UIPanelButtonTemplate")
 btnRestoreHUD:SetWidth(100)
 btnRestoreHUD:SetHeight(20)
-btnRestoreHUD:SetPoint("BOTTOMLEFT", bottomBar, "BOTTOMLEFT", 12, 44)
+btnRestoreHUD:SetPoint("BOTTOMLEFT", bottomBar, "BOTTOMLEFT", 22, 35)
 btnRestoreHUD:SetText("Restore HUD")
 btnRestoreHUD:SetScript("OnClick", function()
     if PocketLog_Data then
@@ -372,9 +446,9 @@ btnRestoreHUD:SetScript("OnClick", function()
 end)
 
 local btnClose = CreateFrame("Button", "PL_WindowCloseBtn", pocketWindow, "UIPanelButtonTemplate")
-btnClose:SetWidth(80)
+btnClose:SetWidth(100)
 btnClose:SetHeight(22)
-btnClose:SetPoint("BOTTOMRIGHT", bottomBar, "BOTTOMRIGHT", -12, 44)
+btnClose:SetPoint("BOTTOMRIGHT", bottomBar, "BOTTOMRIGHT", -22, 10)
 btnClose:SetText("Close")
 btnClose:SetScript("OnClick", function()
     pocketWindow:Hide()
@@ -399,7 +473,12 @@ resetWindow:SetBackdrop({
     tile = true,
     tileSize = 32,
     edgeSize = 32,
-    insets = {left = 8, right = 8, top = 8, bottom = 8}
+    insets = {
+        left = 8,
+        right = 8,
+        top = 8,
+        bottom = 8
+    }
 })
 resetWindow:SetMovable(true)
 resetWindow:EnableMouse(true)
@@ -430,8 +509,10 @@ for index, row in ipairs(resetOptionRows) do
     rowLabel:SetText(row.label)
 
     resetCheckboxes[row.key] = {
-        Session = CreateResetCheckbox("PocketLogResetWindow_" .. row.key .. "_Session", resetWindow, 140, yOffset, row.key, "Session"),
-        AllTime = CreateResetCheckbox("PocketLogResetWindow_" .. row.key .. "_AllTime", resetWindow, 220, yOffset, row.key, "AllTime")
+        Session = CreateResetCheckbox("PocketLogResetWindow_" .. row.key .. "_Session", resetWindow, 140, yOffset,
+            row.key, "Session"),
+        AllTime = CreateResetCheckbox("PocketLogResetWindow_" .. row.key .. "_AllTime", resetWindow, 220, yOffset,
+            row.key, "AllTime")
     }
 end
 
@@ -456,6 +537,52 @@ resetCloseBtn:SetScript("OnClick", function()
     resetWindow:Hide()
 end)
 
+local pauseButton
+
+local function PauseSession()
+
+    if sessionPaused then
+        return
+    end
+
+    sessionPaused = true
+    pauseStarted = GetTime()
+
+    pauseButton:SetText("Resume Session")
+
+    UpdateHUDText()
+
+end
+
+local function ResumeSession()
+
+    if not sessionPaused then
+        return
+    end
+
+    if sessionStartTime and pauseStarted then
+        sessionStartTime = sessionStartTime + (GetTime() - pauseStarted)
+    end
+
+    pauseStarted = nil
+    sessionPaused = false
+
+    pauseButton:SetText("Pause Session")
+
+    UpdateHUDText()
+
+end
+
+local function TogglePause()
+
+    if sessionPaused then
+        ResumeSession()
+    else
+        PauseSession()
+    end
+
+end
+
 -- Options area inside the pocket window (dashboard)
 local function CreateWindowButton(name, text, w, x, y, func)
     local btn = CreateFrame("Button", name, bottomBar, "UIPanelButtonTemplate")
@@ -474,7 +601,7 @@ CreateWindowButton("PL_WinResetOptions", "Reset Options", 100, -110, 10, functio
     end
 end)
 
-CreateWindowButton("PL_WinToggleHUD", "Toggle HUD", 100, 0, 10, function()
+CreateWindowButton("PL_WinToggleHUD", "Toggle HUD", 100, 110, 35, function()
     if hudFrame:IsShown() then
         hudFrame:Hide()
         if PocketLog_Data then
@@ -488,20 +615,33 @@ CreateWindowButton("PL_WinToggleHUD", "Toggle HUD", 100, 0, 10, function()
     end
 end)
 
-CreateWindowButton("PL_WinWipeAll", "Wipe Everything", 100, 110, 10, function()
+CreateWindowButton("PL_WinWipeAll", "Wipe All", 100, 0, 10, function()
     sessionGold, sessionCount, sessionItems, sessionStartTime = 0, 0, {}, nil
     sessionBoxGold, sessionBoxItems = 0, {}
-    PocketLog_Data = {Gold = 0, Count = 0, Items = {}, ShowHUD = true, SilentMode = false, BoxData = {Gold = 0, Items = {}}}
+    PocketLog_Data = {
+        Gold = 0,
+        Count = 0,
+        Items = {},
+        ShowHUD = true,
+        SilentMode = false,
+        BoxData = {
+            Gold = 0,
+            Items = {}
+        }
+    }
     UpdateHUDText()
     pScroll:AddMessage("|cff00ff00[PocketLog]|r Absolutely all session and all-time records purged.")
 end)
+
+pauseButton = CreateWindowButton("PL_WinPause", "Pause Session", 100, 0, 35, TogglePause)
 
 local copyrightText = bottomBar:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
 copyrightText:SetPoint("BOTTOMRIGHT", bottomBar, "BOTTOMRIGHT", -12, 110)
 copyrightText:SetJustifyH("RIGHT")
 copyrightText:SetFont("Fonts\\FRIZQT__.TTF", 8)
 copyrightText:SetText("Brought to you by your fellow rogue Critolis ^^,")
-local silentCheckWindow = CreateFrame("CheckButton", "PocketLogSilentCheckboxWindow", bottomBar, "UICheckButtonTemplate")
+local silentCheckWindow =
+    CreateFrame("CheckButton", "PocketLogSilentCheckboxWindow", bottomBar, "UICheckButtonTemplate")
 silentCheckWindow:SetPoint("BOTTOMLEFT", bottomBar, "BOTTOMLEFT", 12, 74)
 getglobal(silentCheckWindow:GetName() .. "Text"):SetText("Disable Live Chat Spams")
 -- Initialize checkbox state from saved settings (default: enabled)
@@ -517,64 +657,81 @@ silentCheckWindow:SetScript("OnClick", function()
     PocketLog_Data.SilentMode = (this:GetChecked() == 1)
 end)
 
-local function PopulatePocketWindow()
-    pScroll:Clear()
-    pScroll:AddMessage("|cffffff00=== PocketLog Detailed Summary ===|r")
-    pScroll:AddMessage("|cff00ffff--- Session Gold & Items ---|r")
-    pScroll:AddMessage("Session Gold: " .. FormatMoney(sessionGold))
-    local empty = true
-    for name, qty in pairs(sessionItems) do
-        if qty > 0 then
-            pScroll:AddMessage(name .. " x" .. qty)
-            empty = false
+local function AddSortedItemList(title, itemTable, emptyText)
+
+    pScroll:AddMessage(title)
+
+    local items = {}
+
+    for name, qty in pairs(itemTable) do
+        if qty and qty > 0 then
+            table.insert(items, {
+                name = name,
+                qty = qty
+            })
         end
-    end
-    if empty then
-        pScroll:AddMessage("No items logged yet.")
     end
 
-    pScroll:AddMessage("|cff00ffff--- Session Junkbox Gains ---|r")
-    pScroll:AddMessage("Session Junkbox Gold: " .. FormatMoney(sessionBoxGold))
-    local emptySessionBox = true
-    for name, qty in pairs(sessionBoxItems) do
-        if qty > 0 then
-            pScroll:AddMessage(name .. " x" .. qty)
-            emptySessionBox = false
+    table.sort(items, function(a, b)
+
+        if a.qty == b.qty then
+            return a.name < b.name
         end
+
+        return a.qty > b.qty
+
+    end)
+
+    if table.getn(items) == 0 then
+        pScroll:AddMessage(emptyText)
+        return
     end
-    if emptySessionBox then
-        pScroll:AddMessage("No junkbox items logged in this session.")
+
+    for _, item in ipairs(items) do
+
+        pScroll:AddMessage(string.format("  %-28s x%d", item.name, item.qty))
+
     end
+
+end
+
+local function PopulatePocketWindow()
+    pScroll:Clear()
+    pScroll:AddMessage("|cff00ffff--- Session Gold & Items ---|r")
+    pScroll:AddMessage("|cffffff00Gold:|r " .. FormatMoney(sessionGold))
+    AddSortedItemList("|cff00ccccItems:|r", sessionItems, "  No items logged yet.")
+
+    pScroll:AddMessage("")
+
+    pScroll:AddMessage("|cff00ffff--- Session Junkbox Gains ---|r")
+    pScroll:AddMessage("|cffffff00Gold:|r " .. FormatMoney(sessionBoxGold))
+    AddSortedItemList("|cff00ccccItems:|r", sessionBoxItems, "  No junkbox items logged.")
+
+    pScroll:AddMessage("")
 
     local lGold = (PocketLog_Data and PocketLog_Data.Gold) or 0
     local lItems = (PocketLog_Data and PocketLog_Data.Items) or {}
     pScroll:AddMessage("|cff00ffff--- All-Time ---|r")
-    pScroll:AddMessage("All-Time Gold: " .. FormatMoney(lGold))
-    empty = true
-    for name, qty in pairs(lItems) do
-        if qty > 0 then
-            pScroll:AddMessage(name .. " x" .. qty)
-            empty = false
-        end
-    end
-    if empty then
-        pScroll:AddMessage("No historical items logged.")
-    end
+    pScroll:AddMessage("|cffffff00Gold:|r " .. FormatMoney(lGold))
+    AddSortedItemList("|cff00ccccItems:|r", lItems, "  No historical items logged.")
+
+    pScroll:AddMessage("")
 
     if PocketLog_Data and PocketLog_Data.BoxData then
         pScroll:AddMessage("|cff00ffff--- Saved Junkbox Contents ---|r")
-        pScroll:AddMessage("Total Box Gold: " .. FormatMoney(PocketLog_Data.BoxData.Gold))
-        local emptybox = true
-        for name, qty in pairs(PocketLog_Data.BoxData.Items or {}) do
-            if qty > 0 then
-                pScroll:AddMessage(name .. " x" .. qty)
-                emptybox = false
-            end
-        end
-        if emptybox then
-            pScroll:AddMessage("No box items logged.")
-        end
+        pScroll:AddMessage("|cffffff00Gold:|r " .. FormatMoney(PocketLog_Data.BoxData.Gold))
+        AddSortedItemList("|cff00ccccItems:|r", PocketLog_Data.BoxData.Items or {}, "  No box items logged.")
     end
+
+    pScroll:Refresh()
+end
+
+local function RefreshPocketWindow()
+
+    if pocketWindow and pocketWindow:IsShown() then
+        PopulatePocketWindow()
+    end
+
 end
 
 local hudOpenPanelButton = CreateFrame("Button", "PocketLogHUDBtn", hudFrame, "UIPanelButtonTemplate")
@@ -583,8 +740,14 @@ hudOpenPanelButton:SetHeight(18)
 hudOpenPanelButton:SetPoint("TOPRIGHT", hudFrame, "TOPRIGHT", -8, -6)
 hudOpenPanelButton:SetText("...")
 hudOpenPanelButton:SetScript("OnClick", function()
-    PopulatePocketWindow()
     pocketWindow:Show()
+    PopulatePocketWindow()
+
+    scrollFrame:SetVerticalScroll(0)
+
+    if scrollbar then
+        scrollbar:SetValue(0)
+    end
 end)
 
 SLASH_POCKETLOG1 = "/pocket"
@@ -592,8 +755,14 @@ SlashCmdList["POCKETLOG"] = function(msg)
     if pocketWindow:IsShown() then
         pocketWindow:Hide()
     else
-        PopulatePocketWindow()
         pocketWindow:Show()
+        PopulatePocketWindow()
+
+        scrollFrame:SetVerticalScroll(0)
+
+        if scrollbar then
+            scrollbar:SetValue(0)
+        end
         if PocketLog_Data and PocketLog_Data.ShowHUD and hudFrame then
             hudFrame:Show()
             UpdateHUDText()
@@ -611,230 +780,253 @@ SlashCmdList["POCKETRESET"] = function(msg)
     end
 end
 
-local hudRefreshTimer = nil
-hudFrame:SetScript(
-    "OnUpdate",
-    function()
-        if hudRefreshTimer and GetTime() >= hudRefreshTimer then
-            UpdateHUDText()
-            hudRefreshTimer = nil
-        end
+local function GetCoinValue(slot)
+
+    local _, text = GetLootSlotInfo(slot)
+
+    if not text then
+        return 0
     end
-)
 
-frame:SetScript(
-    "OnEvent",
-    function()
-        if event == "VARIABLES_LOADED" then
-            if not PocketLog_Data then
-                PocketLog_Data = {}
-            end
-            if PocketLog_Data.Gold == nil then
-                PocketLog_Data.Gold = 0
-            end
-            if PocketLog_Data.Count == nil then
-                PocketLog_Data.Count = 0
-            end
-            if not PocketLog_Data.Items then
-                PocketLog_Data.Items = {}
-            end
-            if PocketLog_Data.SilentMode == nil then
-                PocketLog_Data.SilentMode = true
-            end
-            if PocketLog_Data.ShowHUD == nil then
-                PocketLog_Data.ShowHUD = true
-            end
-            if PocketLog_Data.HUD_X and PocketLog_Data.HUD_Y then
-                hudFrame:ClearAllPoints()
-                if PocketLog_Data.HUD_Point and PocketLog_Data.HUD_RelativePoint then
-                    hudFrame:SetPoint(PocketLog_Data.HUD_Point, UIParent, PocketLog_Data.HUD_RelativePoint, PocketLog_Data.HUD_X, PocketLog_Data.HUD_Y)
-                else
-                    hudFrame:SetPoint("CENTER", UIParent, "CENTER", PocketLog_Data.HUD_X, PocketLog_Data.HUD_Y)
-                end
-            end
-            if PocketLog_Data.ShowHUD then
-                hudFrame:Show()
-            else
-                hudFrame:Hide()
-            end
-            hudFrame:SetClampedToScreen(true)
-            if not PocketLog_Data.BoxData then
-                PocketLog_Data.BoxData = {Gold = 0, Items = {}}
-            end
-            if not PocketLog_Data.ResetSelections then
-                PocketLog_Data.ResetSelections = {
-                    StolenGold = {Session = false, AllTime = false},
-                    StolenItems = {Session = false, AllTime = false},
-                    JunkboxGold = {Session = false, AllTime = false},
-                    JunkboxItems = {Session = false, AllTime = false}
+    text = string.lower(text)
+
+    local value = 0
+
+    local _, _, g = string.find(text, "(%d+) gold")
+    local _, _, s = string.find(text, "(%d+) silver")
+    local _, _, c = string.find(text, "(%d+) copper")
+
+    if g then
+        value = value + tonumber(g) * 10000
+    end
+
+    if s then
+        value = value + tonumber(s) * 100
+    end
+
+    if c then
+        value = value + tonumber(c)
+    end
+
+    return value
+
+end
+
+local function CacheLoot(source)
+
+    activeLootCache = {}
+    slotClearedThisWindow = false
+
+    for slot = 1, GetNumLootItems() do
+
+        local _, name, qty = GetLootSlotInfo(slot)
+
+        if name then
+
+            if LootSlotIsCoin(slot) then
+
+                activeLootCache[slot] = {
+                    source = source,
+                    isCoin = true,
+                    amount = GetCoinValue(slot)
                 }
+
+            else
+
+                activeLootCache[slot] = {
+                    source = source,
+                    isCoin = false,
+                    link = GetLootSlotLink(slot) or name,
+                    count = qty or 1
+                }
+
             end
 
-            ApplyResetSelectionsToUI()
-            -- Sync silent checkbox state after saved-vars load (ensure UI reflects saved value)
-            if silentCheckWindow then
-                if PocketLog_Data.SilentMode then
-                    silentCheckWindow:SetChecked(1)
-                else
-                    silentCheckWindow:SetChecked(nil)
-                end
+        end
+
+    end
+
+end
+
+frame:SetScript("OnEvent", function()
+    if event == "VARIABLES_LOADED" then
+        if not PocketLog_Data then
+            PocketLog_Data = {}
+        end
+        if PocketLog_Data.Gold == nil then
+            PocketLog_Data.Gold = 0
+        end
+        if PocketLog_Data.Count == nil then
+            PocketLog_Data.Count = 0
+        end
+        if not PocketLog_Data.Items then
+            PocketLog_Data.Items = {}
+        end
+        if PocketLog_Data.SilentMode == nil then
+            PocketLog_Data.SilentMode = true
+        end
+        if PocketLog_Data.ShowHUD == nil then
+            PocketLog_Data.ShowHUD = true
+        end
+        if PocketLog_Data.HUD_X and PocketLog_Data.HUD_Y then
+            hudFrame:ClearAllPoints()
+            if PocketLog_Data.HUD_Point and PocketLog_Data.HUD_RelativePoint then
+                hudFrame:SetPoint(PocketLog_Data.HUD_Point, UIParent, PocketLog_Data.HUD_RelativePoint,
+                    PocketLog_Data.HUD_X, PocketLog_Data.HUD_Y)
+            else
+                hudFrame:SetPoint("CENTER", UIParent, "CENTER", PocketLog_Data.HUD_X, PocketLog_Data.HUD_Y)
             end
-            UpdateHUDText()
+        end
+        if PocketLog_Data.ShowHUD then
+            hudFrame:Show()
+        else
+            hudFrame:Hide()
+        end
+        hudFrame:SetClampedToScreen(true)
+        if not PocketLog_Data.BoxData then
+            PocketLog_Data.BoxData = {
+                Gold = 0,
+                Items = {}
+            }
+        end
+        if not PocketLog_Data.ResetSelections then
+            PocketLog_Data.ResetSelections = {
+                StolenGold = {
+                    Session = false,
+                    AllTime = false
+                },
+                StolenItems = {
+                    Session = false,
+                    AllTime = false
+                },
+                JunkboxGold = {
+                    Session = false,
+                    AllTime = false
+                },
+                JunkboxItems = {
+                    Session = false,
+                    AllTime = false
+                }
+            }
+        end
+
+        ApplyResetSelectionsToUI()
+        -- Sync silent checkbox state after saved-vars load (ensure UI reflects saved value)
+        if silentCheckWindow then
+            if PocketLog_Data.SilentMode then
+                silentCheckWindow:SetChecked(1)
+            else
+                silentCheckWindow:SetChecked(nil)
+            end
+        end
+        UpdateHUDText()
+        return
+    end
+    if event == "CHAT_MSG_SPELL_SELF_BUFF" and arg1 then
+        local castText = string.lower(arg1)
+        if string.find(castText, "junkbox") then
+            lootMode = "box"
+            if string.find(castText, "heavy") then
+                currentBoxName = "Heavy Junkbox"
+            elseif string.find(castText, "sturdy") then
+                currentBoxName = "Sturdy Junkbox"
+            else
+                currentBoxName = "Battered Junkbox"
+            end
             return
         end
-        if event == "CHAT_MSG_SPELL_SELF_BUFF" and arg1 then
-            local castText = string.lower(arg1)
-            if string.find(castText, "junkbox") then
-                isOpeningJunkbox = true
-                if string.find(castText, "heavy") then
-                    currentBoxName = "Heavy Junkbox"
-                elseif string.find(castText, "sturdy") then
-                    currentBoxName = "Sturdy Junkbox"
-                else
-                    currentBoxName = "Battered Junkbox"
-                end
-                return
-            end
-        end
-        if event == "LOOT_OPENED" then
-            activeLootCache, slotClearedThisWindow = {}, false
+    end
+    if event == "LOOT_OPENED" then
+        activeLootCache = {}
+        slotClearedThisWindow = false
 
-            if isOpeningJunkbox then
-                isPickpocketActive = false
-                for slot = 1, GetNumLootItems() do
-                    local _, name, qty = GetLootSlotInfo(slot)
-                    if name then
-                        if LootSlotIsCoin(slot) then
-                            -- Process coins found inside the lockbox
-                            local text, ext = string.lower(name), 0
-                            local _, _, g = string.find(text, "(%d+) gold")
-                            local _, _, s = string.find(text, "(%d+) silver")
-                            local _, _, c = string.find(text, "(%d+) copper")
-                            if g then
-                                ext = ext + (tonumber(g) * 10000)
-                            end
-                            if s then
-                                ext = ext + (tonumber(s) * 100)
-                            end
-                            if c then
-                                ext = ext + tonumber(c)
-                            end
-                            activeLootCache[slot] = {isCoin = true, isFromBox = true, amount = ext}
-                        else
-                            -- Process items (gems, potions, cloth) found inside the lockbox
-                            activeLootCache[slot] = {
-                                isCoin = false,
-                                isFromBox = true,
-                                link = GetLootSlotLink(slot) or name,
-                                count = qty or 1
-                            }
-                        end
-                    end
-                end
-            elseif UnitExists("target") and not UnitIsDead("target") and not UnitIsPlayer("target") then
-                isPickpocketActive = true
-                for slot = 1, GetNumLootItems() do
-                    local _, name, qty = GetLootSlotInfo(slot)
-                    if name then
-                        if LootSlotIsCoin(slot) then
-                            local text, ext = string.lower(name), 0
-                            local _, _, g = string.find(text, "(%d+) gold")
-                            local _, _, s = string.find(text, "(%d+) silver")
-                            local _, _, c = string.find(text, "(%d+) copper")
-                            if g then
-                                ext = ext + (tonumber(g) * 10000)
-                            end
-                            if s then
-                                ext = ext + (tonumber(s) * 100)
-                            end
-                            if c then
-                                ext = ext + tonumber(c)
-                            end
-                            activeLootCache[slot] = {isCoin = true, amount = ext}
-                        else
-                            activeLootCache[slot] = {
-                                isCoin = false,
-                                link = GetLootSlotLink(slot) or name,
-                                count = qty or 1
-                            }
-                        end
-                    end
-                end
-            else
-                isPickpocketActive = false
-                isOpeningJunkbox = false
-                return
-            end
-        end
-
-        if event == "LOOT_SLOT_CLEARED" and arg1 then
-            local data = activeLootCache[tonumber(arg1)]
-            if data then
-                local silent = (PocketLog_Data and PocketLog_Data.SilentMode)
-
-                -- PROCESS LOCKBOX EXTRACTIONS
-                if data.isFromBox then
-                    -- PROCESS STANDARD PICKPOCKETING
-                    if not PocketLog_Data.BoxData then
-                        PocketLog_Data.BoxData = {Gold = 0, Items = {}}
-                    end
-
-                    if data.isCoin and data.amount > 0 then
-                        PocketLog_Data.BoxData.Gold = PocketLog_Data.BoxData.Gold + data.amount
-                        sessionBoxGold = sessionBoxGold + data.amount
-                        if pocketWindow and pocketWindow:IsShown() and pScroll then
-                            pScroll:AddMessage("|cff00ff00[PocketLog Box]|r Found Coin: " .. FormatMoney(data.amount))
-                        end
-                        if not silent then
-                            DEFAULT_CHAT_FRAME:AddMessage("|cff00ff00[PocketLog Box]|r Found Coin: " .. FormatMoney(data.amount))
-                        end
-                    elseif not data.isCoin and data.link then
-                        PocketLog_Data.BoxData.Items[data.link] =
-                            (PocketLog_Data.BoxData.Items[data.link] or 0) + data.count
-                        sessionBoxItems[data.link] = (sessionBoxItems[data.link] or 0) + data.count
-                        if pocketWindow and pocketWindow:IsShown() and pScroll then
-                            pScroll:AddMessage("|cff00ff00[PocketLog Box]|r Found Item: " .. data.link .. " x" .. data.count)
-                        end
-                        if not silent then
-                            DEFAULT_CHAT_FRAME:AddMessage("|cff00ff00[PocketLog Box]|r Found Item: " .. data.link .. " x" .. data.count)
-                        end
-                    end
-                elseif isPickpocketActive then
-                    if not sessionStartTime then
-                        sessionStartTime = GetTime()
-                    end
-                    if not slotClearedThisWindow then
-                        sessionCount = sessionCount + 1
-                        if PocketLog_Data then
-                            PocketLog_Data.Count = PocketLog_Data.Count + 1
-                        end
-                        slotClearedThisWindow = true
-                    end
-                    if data.isCoin and data.amount > 0 then
-                        sessionGold = sessionGold + data.amount
-                        if PocketLog_Data then
-                            PocketLog_Data.Gold = PocketLog_Data.Gold + data.amount
-                        end
-                        if not silent then
-                            DEFAULT_CHAT_FRAME:AddMessage(
-                                "|cff00ff00[PocketLog]|r Mugged: " .. FormatMoney(data.amount)
-                            )
-                        end
-                    elseif not data.isCoin and data.link then
-                        sessionItems[data.link] = (sessionItems[data.link] or 0) + data.count
-                        if PocketLog_Data then
-                            PocketLog_Data.Items[data.link] = (PocketLog_Data.Items[data.link] or 0) + data.count
-                        end
-                        if not silent then
-                            DEFAULT_CHAT_FRAME:AddMessage(
-                                "|cff00ff00[PocketLog]|r Stole: " .. data.link .. " x" .. data.count
-                            )
-                        end
-                    end
-                    hudRefreshTimer = GetTime() + 0.2
-                end
-                activeLootCache[tonumber(arg1)] = nil
-            end
+        if lootMode == "box" then
+            CacheLoot("box")
+            lootMode = nil
+        elseif UnitExists("target") and not UnitIsDead("target") and not UnitIsPlayer("target") then
+            CacheLoot("pick")
+        else
+            lootMode = nil
+            return
         end
     end
-)
+
+    if event == "LOOT_SLOT_CLEARED" and arg1 then
+        if sessionPaused then
+            return
+        end
+        local data = activeLootCache[tonumber(arg1)]
+        if data then
+            local silent = (PocketLog_Data and PocketLog_Data.SilentMode)
+
+            -- PROCESS LOCKBOX EXTRACTIONS
+            if data.source == "box" then
+                -- PROCESS STANDARD PICKPOCKETING
+                if not PocketLog_Data.BoxData then
+                    PocketLog_Data.BoxData = {
+                        Gold = 0,
+                        Items = {}
+                    }
+                end
+
+                if data.isCoin and data.amount > 0 then
+                    PocketLog_Data.BoxData.Gold = PocketLog_Data.BoxData.Gold + data.amount
+                    sessionBoxGold = sessionBoxGold + data.amount
+                    RefreshPocketWindow()
+                    if pocketWindow and pocketWindow:IsShown() and pScroll then
+                        pScroll:AddMessage("|cff00ff00[PocketLog Box]|r Found Coin: " .. FormatMoney(data.amount))
+                    end
+                    if not silent then
+                        DEFAULT_CHAT_FRAME:AddMessage("|cff00ff00[PocketLog Box]|r Found Coin: " ..
+                                                          FormatMoney(data.amount))
+                    end
+                elseif not data.isCoin and data.link then
+                    PocketLog_Data.BoxData.Items[data.link] =
+                        (PocketLog_Data.BoxData.Items[data.link] or 0) + data.count
+                    sessionBoxItems[data.link] = (sessionBoxItems[data.link] or 0) + data.count
+                    RefreshPocketWindow()
+                    if pocketWindow and pocketWindow:IsShown() and pScroll then
+                        pScroll:AddMessage("|cff00ff00[PocketLog Box]|r Found Item: " .. data.link .. " x" .. data.count)
+                    end
+                    if not silent then
+                        DEFAULT_CHAT_FRAME:AddMessage("|cff00ff00[PocketLog Box]|r Found Item: " .. data.link .. " x" ..
+                                                          data.count)
+                    end
+                end
+            elseif data.source == "pick" then
+                if not sessionStartTime then
+                    sessionStartTime = GetTime()
+                end
+                if not slotClearedThisWindow then
+                    sessionCount = sessionCount + 1
+                    if PocketLog_Data then
+                        PocketLog_Data.Count = PocketLog_Data.Count + 1
+                    end
+                    slotClearedThisWindow = true
+                end
+                if data.isCoin and data.amount > 0 then
+                    sessionGold = sessionGold + data.amount
+                    RefreshPocketWindow()
+                    if PocketLog_Data then
+                        PocketLog_Data.Gold = PocketLog_Data.Gold + data.amount
+                    end
+                    if not silent then
+                        DEFAULT_CHAT_FRAME:AddMessage("|cff00ff00[PocketLog]|r Mugged: " .. FormatMoney(data.amount))
+                    end
+                elseif not data.isCoin and data.link then
+                    sessionItems[data.link] = (sessionItems[data.link] or 0) + data.count
+                    RefreshPocketWindow()
+                    if PocketLog_Data then
+                        PocketLog_Data.Items[data.link] = (PocketLog_Data.Items[data.link] or 0) + data.count
+                    end
+                    if not silent then
+                        DEFAULT_CHAT_FRAME:AddMessage("|cff00ff00[PocketLog]|r Stole: " .. data.link .. " x" ..
+                                                          data.count)
+                    end
+                end
+                hudRefreshTimer = GetTime() + 0.2
+            end
+            activeLootCache[tonumber(arg1)] = nil
+        end
+    end
+end)
