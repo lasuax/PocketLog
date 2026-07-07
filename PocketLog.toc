@@ -3,4 +3,5 @@
 ## Notes: Lightweight item, gold, and headcount pickpocket logging for Vanilla 1.12.
 ## Author: Critolis
 ## SavedVariables: PocketLog_Data
+## Version: 1.0.0
 PocketLog.lua
